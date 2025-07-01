@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 pydantic
-pyrofork
+kurigram
 tgcrypto
 aiohttp
 python-dateutil
