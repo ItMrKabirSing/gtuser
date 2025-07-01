@@ -90,7 +90,7 @@ class ClientManager:
                     if bot_token in self.clients:
                         del self.clients[bot_token]
 
-            # Create new client with more conservative settings
+            # Create new client with valid parameters only
             session_name = f"bot_{uuid4().hex[:8]}"
             client = Client(
                 name=session_name,
@@ -101,7 +101,7 @@ class ClientManager:
                 max_concurrent_transmissions=8,  # Reduced
                 sleep_threshold=120,  # Reduced
                 workers=4,  # Reduced
-                timeout=30,  # Add timeout
+                # Removed 'timeout' parameter as it's not supported
             )
 
             try:
@@ -402,20 +402,25 @@ async def get_bot_data_fast(
             )
 
             # Wait for both tasks
-            me, (chats, users) = await asyncio.gather(
+            results = await asyncio.gather(
                 bot_info_task,
                 chats_users_task,
                 return_exceptions=True
             )
+            
+            me = results[0]
+            chats_users = results[1]
 
             # Handle exceptions
             if isinstance(me, Exception):
                 logger.error(f"Error getting bot info: {me}")
                 raise me
                 
-            if isinstance(chats, Exception) or isinstance(users, Exception):
-                logger.warning(f"Error getting chats/users: {chats if isinstance(chats, Exception) else users}")
+            if isinstance(chats_users, Exception):
+                logger.warning(f"Error getting chats/users: {chats_users}")
                 chats, users = [], []
+            else:
+                chats, users = chats_users
 
             # Ensure we have valid data
             if not isinstance(chats, list):
