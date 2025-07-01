@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic
+pyrofork
+tgcrypto
+aiohttp
+python-dateutil
