@@ -8,20 +8,19 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Query, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from pyrogram import Client
-from pyrogram.raw import functions, types
-from pyrogram.errors import FloodWait, RPCError, AuthKeyUnregistered, UserDeactivated
+from telethon import TelegramClient
+from telethon.errors import FloodWaitError, RPCError, AuthKeyPermEmptyError, SessionPasswordNeededError
+from telethon import functions, types
 from uuid import uuid4
 import aiohttp
+from datetime import datetime
 
-# Enhanced logging with detailed format
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Try to use uvloop for better performance
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -29,7 +28,6 @@ try:
 except ImportError:
     logger.warning("uvloop not available, using default event loop")
 
-# Pydantic models
 class BotInfoModel(BaseModel):
     first_name: str
     id: int
@@ -57,13 +55,12 @@ class BotDataResponse(BaseModel):
     total_users: int = Field(..., description="Total number of users")
     processing_time: float = Field(..., description="Processing time in seconds")
 
-# Connection management
 class ClientManager:
     def __init__(self):
-        self.clients: Dict[str, Client] = {}
+        self.clients: Dict[str, TelegramClient] = {}
         self.locks: Dict[str, asyncio.Lock] = {}
         self.global_lock = asyncio.Lock()
-        self.executor = ThreadPoolExecutor(max_workers=2)  # Reduced for stability
+        self.executor = ThreadPoolExecutor(max_workers=2)
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def get_session(self) -> aiohttp.ClientSession:
@@ -71,7 +68,7 @@ class ClientManager:
             self._session = aiohttp.ClientSession()
         return self._session
 
-    async def get_client(self, bot_token: str, api_id: int, api_hash: str) -> Client:
+    async def get_client(self, bot_token: str, api_id: int, api_hash: str) -> TelegramClient:
         async with self.global_lock:
             if bot_token not in self.locks:
                 self.locks[bot_token] = asyncio.Lock()
@@ -80,31 +77,26 @@ class ClientManager:
             if bot_token in self.clients:
                 client = self.clients[bot_token]
                 try:
-                    if client.is_connected:
+                    if client.is_connected():
                         return client
                     else:
-                        await client.stop()
+                        await client.disconnect()
                         del self.clients[bot_token]
                 except Exception as e:
                     logger.warning(f"Client connection issue: {e}")
                     if bot_token in self.clients:
                         del self.clients[bot_token]
 
-            # Create new client with valid parameters only
             session_name = f"bot_{uuid4().hex[:8]}"
-            client = Client(
-                name=session_name,
-                bot_token=bot_token,
+            client = TelegramClient(
+                session=session_name,
                 api_id=api_id,
                 api_hash=api_hash,
-                in_memory=True,
-                max_concurrent_transmissions=8,
-                sleep_threshold=120,
-                workers=4,
+                base_logger=logger
             )
 
             try:
-                await asyncio.wait_for(client.start(), timeout=30.0)
+                await asyncio.wait_for(client.start(bot_token=bot_token), timeout=30.0)
                 async with self.global_lock:
                     self.clients[bot_token] = client
                 logger.info(f"Client created successfully for token: {bot_token[:10]}...")
@@ -112,7 +104,7 @@ class ClientManager:
             except Exception as e:
                 logger.error(f"Failed to create client: {e}")
                 try:
-                    await client.stop()
+                    await client.disconnect()
                 except:
                     pass
                 raise HTTPException(status_code=400, detail=f"Failed to connect to Telegram: {str(e)}")
@@ -123,8 +115,8 @@ class ClientManager:
                 if bot_token in self.clients:
                     client = self.clients[bot_token]
                     try:
-                        if client.is_connected:
-                            await asyncio.wait_for(client.stop(), timeout=10.0)
+                        if client.is_connected():
+                            await asyncio.wait_for(client.disconnect(), timeout=10.0)
                     except Exception as e:
                         logger.warning(f"Error stopping client: {e}")
                     finally:
@@ -148,7 +140,6 @@ class ClientManager:
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
 
-# Application lifespan management
 client_manager = ClientManager()
 
 @asynccontextmanager
@@ -160,7 +151,6 @@ async def lifespan(app: FastAPI):
         await client_manager.shutdown()
         logger.info("API shutdown complete")
 
-# FastAPI app
 app = FastAPI(
     title="Enhanced Telegram Users API",
     description="High-performance async API for Telegram bot data with improved concurrency",
@@ -168,9 +158,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Chat type normalization
 def normalize_chat_type(raw_type: str) -> str:
-    """Normalize chat type strings"""
     type_map = {
         "chat": "group",
         "channel": "channel",
@@ -180,9 +168,7 @@ def normalize_chat_type(raw_type: str) -> str:
     }
     return type_map.get(raw_type.lower(), raw_type.lower())
 
-# Chat merge logic
 def merge_chat_data(existing: Optional[ChatModel], new: ChatModel) -> ChatModel:
-    """Merge chat data with existing data taking precedence for non-null values"""
     if not existing:
         return new
     return ChatModel(
@@ -193,37 +179,55 @@ def merge_chat_data(existing: Optional[ChatModel], new: ChatModel) -> ChatModel:
         username=new.username if new.username else existing.username
     )
 
-# Enhanced chat and user fetching with better error handling
-async def get_chats_and_users_fast(client: Client) -> Tuple[List[ChatModel], List[UserModel]]:
-    """Fetch chats and users with improved error handling and performance"""
+async def fetch_chat_participants(client: TelegramClient, chat_id: int, chat_type: str) -> List[UserModel]:
+    users = []
+    try:
+        if chat_type in ["group", "channel"]:
+            async for participant in client.iter_participants(chat_id, limit=500):
+                users.append(UserModel(
+                    id=participant.id,
+                    first_name=participant.first_name,
+                    last_name=participant.last_name,
+                    username=participant.username,
+                    is_premium=participant.premium
+                ))
+    except Exception as e:
+        logger.warning(f"Failed to fetch participants for chat {chat_id}: {str(e)}")
+    return users
+
+async def get_chats_and_users_fast(client: TelegramClient) -> Tuple[List[ChatModel], List[UserModel]]:
     chats: Dict[int, ChatModel] = {}
     users: Dict[int, UserModel] = {}
     inaccessible_chats = set()
     batch_count = 0
-    custom_pts = 1
-    custom_date = 1
-    custom_qts = 1
+    try:
+        state = await client.get_state()
+        custom_pts = state.pts
+        custom_date = state.date
+        custom_qts = state.qts
+    except Exception as e:
+        logger.warning(f"Failed to get initial state: {e}, using defaults")
+        custom_pts = 1
+        custom_date = datetime.now()
+        custom_qts = 1
     start_time = time.time()
-    max_duration = 300  # 5 minutes timeout
+    max_duration = 300
 
     try:
         while time.time() - start_time < max_duration:
             try:
                 diff = await asyncio.wait_for(
-                    client.invoke(
-                        functions.updates.GetDifference(
-                            pts=custom_pts,
-                            date=custom_date,
-                            qts=custom_qts,
-                            pts_limit=5000,
-                            pts_total_limit=1000000,
-                            qts_limit=5000
-                        )
-                    ),
+                    client(functions.updates.GetDifferenceRequest(
+                        pts=custom_pts,
+                        date=custom_date,
+                        qts=custom_qts,
+                        pts_limit=10000,
+                        pts_total_limit=2000000,
+                        qts_limit=10000
+                    )),
                     timeout=60.0
                 )
 
-                # Process users
                 batch_users = []
                 for user in getattr(diff, 'users', []):
                     if user.id not in users:
@@ -240,7 +244,6 @@ async def get_chats_and_users_fast(client: Client) -> Tuple[List[ChatModel], Lis
                             "username": getattr(user, 'username', None)
                         })
 
-                # Process chats
                 batch_chats = []
                 for chat in getattr(diff, 'chats', []):
                     if chat.id not in chats and chat.id not in inaccessible_chats:
@@ -251,7 +254,7 @@ async def get_chats_and_users_fast(client: Client) -> Tuple[List[ChatModel], Lis
                         chat_type = normalize_chat_type(chat_class_name)
                         chat_data = ChatModel(
                             id=chat.id,
-                            members_count=getattr(chat, 'members_count', None),
+                            members_count=getattr(chat, 'participants_count', None),
                             title=getattr(chat, 'title', None) or getattr(chat, 'first_name', None) or "Unknown",
                             type=chat_type,
                             username=getattr(chat, 'username', None)
@@ -265,34 +268,31 @@ async def get_chats_and_users_fast(client: Client) -> Tuple[List[ChatModel], Lis
                             "username": chat_data.username
                         })
 
-                # Process messages to extract additional chats
                 for update in getattr(diff, 'new_messages', []):
-                    if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
-                        if hasattr(update.message, 'chat') and update.message.chat:
-                            chat = update.message.chat
-                            if chat.id not in chats and chat.id not in inaccessible_chats:
-                                chat_class_name = chat.__class__.__name__.lower()
-                                if chat_class_name in ["chatforbidden", "channelforbidden"]:
-                                    inaccessible_chats.add(chat.id)
-                                    continue
-                                chat_type = normalize_chat_type(chat_class_name)
-                                chat_data = ChatModel(
-                                    id=chat.id,
-                                    members_count=getattr(chat, 'members_count', None),
-                                    title=getattr(chat, 'title', None) or getattr(chat, 'first_name', None) or "Unknown",
-                                    type=chat_type,
-                                    username=getattr(chat, 'username', None)
-                                )
-                                chats[chat.id] = merge_chat_data(chats.get(chat.id), chat_data)
-                                batch_chats.append({
-                                    "id": chat_data.id,
-                                    "members_count": chat_data.members_count,
-                                    "title": chat_data.title,
-                                    "type": chat_data.type,
-                                    "username": chat_data.username
-                                })
+                    if hasattr(update, 'message') and hasattr(update.message, 'peer_id'):
+                        chat = await client.get_entity(update.message.peer_id)
+                        if chat.id not in chats and chat.id not in inaccessible_chats:
+                            chat_class_name = chat.__class__.__name__.lower()
+                            if chat_class_name in ["chatforbidden", "channelforbidden"]:
+                                inaccessible_chats.add(chat.id)
+                                continue
+                            chat_type = normalize_chat_type(chat_class_name)
+                            chat_data = ChatModel(
+                                id=chat.id,
+                                members_count=getattr(chat, 'participants_count', None),
+                                title=getattr(chat, 'title', None) or getattr(chat, 'first_name', None) or "Unknown",
+                                type=chat_type,
+                                username=getattr(chat, 'username', None)
+                            )
+                            chats[chat.id] = merge_chat_data(chats.get(chat.id), chat_data)
+                            batch_chats.append({
+                                "id": chat_data.id,
+                                "members_count": chat_data.members_count,
+                                "title": chat_data.title,
+                                "type": chat_data.type,
+                                "username": chat_data.username
+                            })
 
-                # Log batch details
                 if batch_users or batch_chats:
                     logger.info(f"Batch {batch_count}:")
                     logger.info(f"  Users fetched: {len(batch_users)}")
@@ -308,7 +308,6 @@ async def get_chats_and_users_fast(client: Client) -> Tuple[List[ChatModel], Lis
 
                 batch_count += 1
 
-                # Update state for next iteration
                 if isinstance(diff, types.updates.DifferenceSlice):
                     custom_pts = diff.intermediate_state.pts
                     custom_date = diff.intermediate_state.date
@@ -319,27 +318,34 @@ async def get_chats_and_users_fast(client: Client) -> Tuple[List[ChatModel], Lis
                     logger.warning(f"Unknown diff type: {type(diff)}")
                     break
 
-                # Small delay to prevent overwhelming the API
                 await asyncio.sleep(0.05)
 
             except asyncio.TimeoutError:
                 logger.warning("GetDifference timeout, continuing with collected data")
                 break
-            except FloodWait as fw:
-                if fw.value > 30:
-                    logger.warning(f"FloodWait too long: {fw.value}s, breaking")
+            except FloodWaitError as fw:
+                if fw.seconds > 30:
+                    logger.warning(f"FloodWait too long: {fw.seconds}s, breaking")
                     break
-                logger.info(f"FloodWait: {fw.value}s")
-                await asyncio.sleep(fw.value)
+                logger.info(f"FloodWait: {fw.seconds}s")
+                await asyncio.sleep(fw.seconds)
             except Exception as e:
                 logger.error(f"Error in iteration {batch_count}: {str(e)}")
                 if batch_count > 50:
                     break
                 await asyncio.sleep(1)
 
-        # Check if we hit the timeout
         if time.time() - start_time >= max_duration:
-            logger.warning("Reached 5-minute timeout, returning collected data")
+            logger.warning("Reached 5-minute timeout, proceeding to fetch chat participants")
+
+        logger.info(f"Fetching participants from {len(chats)} chats to ensure all users are captured")
+        for chat_id, chat in chats.items():
+            if chat.type in ["group", "channel"]:
+                additional_users = await fetch_chat_participants(client, chat_id, chat.type)
+                for user in additional_users:
+                    if user.id not in users:
+                        users[user.id] = user
+                        logger.debug(f"Added user {user.id} from chat {chat_id}")
 
     except Exception as e:
         logger.error(f"Major error fetching chats and users: {str(e)}")
@@ -347,10 +353,8 @@ async def get_chats_and_users_fast(client: Client) -> Tuple[List[ChatModel], Lis
     logger.info(f"Collected {len(chats)} chats and {len(users)} users in {batch_count} batches")
     return list(chats.values()), list(users.values())
 
-# API Routes
 @app.get("/")
 async def get_api_info():
-    """Get API information and available endpoints"""
     return {
         "api_name": "Enhanced Telegram Users API",
         "version": "2.1.0",
@@ -390,7 +394,6 @@ async def get_api_info():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "healthy",
         "timestamp": time.time(),
@@ -402,9 +405,6 @@ async def get_bot_data_fast(
     background_tasks: BackgroundTasks,
     token: str = Query(..., description="Telegram Bot Token", min_length=10)
 ):
-    """
-    Fetch comprehensive bot data including bot info, chats, and users
-    """
     start_time = time.time()
     
     if not token or len(token.strip()) < 10:
@@ -413,23 +413,20 @@ async def get_bot_data_fast(
     try:
         logger.info(f"Processing request for token: {token[:10]}...")
         
-        # Create/get client with proper connection management
         client = await client_manager.get_client(
             bot_token=token.strip(),
             api_id=26512884,
             api_hash="c3f491cd59af263cfc249d3f93342ef8"
         )
 
-        # Run tasks concurrently with timeouts
         try:
             bot_info_task = asyncio.create_task(
                 asyncio.wait_for(client.get_me(), timeout=15.0)
             )
             chats_users_task = asyncio.create_task(
-                asyncio.wait_for(get_chats_and_users_fast(client), timeout=300.0)  # 5-minute timeout
+                asyncio.wait_for(get_chats_and_users_fast(client), timeout=300.0)
             )
 
-            # Wait for both tasks
             results = await asyncio.gather(
                 bot_info_task,
                 chats_users_task,
@@ -439,7 +436,6 @@ async def get_bot_data_fast(
             me = results[0]
             chats_users = results[1]
 
-            # Handle exceptions
             if isinstance(me, Exception):
                 logger.error(f"Error getting bot info: {me}")
                 raise me
@@ -450,13 +446,11 @@ async def get_bot_data_fast(
             else:
                 chats, users = chats_users
 
-            # Ensure we have valid data
             if not isinstance(chats, list):
                 chats = []
             if not isinstance(users, list):
                 users = []
 
-            # Create response
             bot_info = BotInfoModel(
                 first_name=me.first_name or "Unknown",
                 id=me.id,
@@ -476,7 +470,6 @@ async def get_bot_data_fast(
 
             logger.info(f"Request completed in {processing_time:.3f}s - Chats: {len(chats)}, Users: {len(users)}")
             
-            # Schedule cleanup
             background_tasks.add_task(client_manager.cleanup_client, token.strip())
             
             return response
@@ -486,7 +479,7 @@ async def get_bot_data_fast(
             await client_manager.cleanup_client(token.strip())
             raise HTTPException(status_code=408, detail="Request timeout - try again")
 
-    except (AuthKeyUnregistered, UserDeactivated) as e:
+    except (AuthKeyPermEmptyError, SessionPasswordNeededError) as e:
         logger.error(f"Authentication error: {e}")
         await client_manager.cleanup_client(token.strip())
         raise HTTPException(status_code=401, detail="Invalid bot token or bot deactivated")
@@ -501,7 +494,6 @@ async def get_bot_data_fast(
         await client_manager.cleanup_client(token.strip())
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# Error handlers
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     logger.error(f"Global exception handler: {exc}", exc_info=True)
@@ -510,19 +502,16 @@ async def global_exception_handler(request, exc):
         content={"detail": "Internal server error occurred"}
     )
 
-# Main entry point
 if __name__ == "__main__":
     import uvicorn
     
-    # Get port from environment variable (Render provides this)
     port = int(os.environ.get("PORT", 8000))
     host = os.environ.get("HOST", "0.0.0.0")
     
     logger.info(f"Starting server on {host}:{port}")
     
-    # Run with production settings
     uvicorn.run(
-        "app:app",
+        "main:app",
         host=host,
         port=port,
         workers=1,
