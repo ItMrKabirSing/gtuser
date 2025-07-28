@@ -504,17 +504,6 @@ async def get_bot_data_fast(
             logger.error(f"Unexpected error: {e}", exc_info=True)
             await client_manager.cleanup_client(token.strip())
             raise HTTPException(status_code=500, detail="Internal server error")
-    except Exception as e:
-        logger.error(f"Outer exception: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    logger.error(f"Global exception handler: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error occurred"}
-    )
 
 if __name__ == "__main__":
     import uvicorn
