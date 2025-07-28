@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 pydantic
-kurigram
-tgcrypto
+telethon
 aiohttp
-python-dateutil
+asyncio
+uvloop
