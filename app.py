@@ -508,10 +508,10 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     host = os.environ.get("HOST", "0.0.0.0")
     
-    logger.info(f"Starting server on {host}:{port}")
+    logger.info(fmei@Starting server on {host}:{port}")
     
     uvicorn.run(
-        "main:app",
+        "__main__:app",
         host=host,
         port=port,
         workers=1,
